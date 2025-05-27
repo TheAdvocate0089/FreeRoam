@@ -1,369 +1,286 @@
-import logging
-import requests
+#!/usr/bin/env python3
+import os
+import sys
 import json
-import random
 import time
+import logging
+import random
 import threading
+import requests
+
 from datetime import datetime, timedelta
+from functools import wraps
+from pathlib import Path
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from argparse import ArgumentParser
 
-USERNAME = ""
-PASSWORD = ""
-CARDBIN = "528911"
-JWT_Default = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJjbGllbnRfaWQiOjQsImZpcnN0X25hbWUiOiJUcmF2ZWwiLCJsYXN0X25hbWUiOiJBcHAiLCJlbWFpbCI6InRyYXZlbGFwcEBmbGV4aXJvYW0uY29tIiwidHlwZSI6IkNsaWVudCIsImFjY2Vzc190eXBlIjoiQXBwIiwidXNlcl9hY2NvdW50X2lkIjo2LCJ1c2VyX3JvbGUiOiJWaWV3ZXIiLCJwZXJtaXNzaW9uIjpbXSwiZXhwaXJlIjoxODc5NjcwMjYwfQ.-RtM_zNG-zBsD_S2oOEyy4uSbqR7wReAI92gp9uh-0Y"
+# ──────────────────────────────────────────────────────────────────────────────
+# Configuration & Constants
+# ──────────────────────────────────────────────────────────────────────────────
+DEFAULT_CONFIG = {
+    "USERNAME": "",
+    "PASSWORD": "",
+    "CARDBIN": "528911",
+    "JWT_DEFAULT": "",
+    "STATE_FILE": "state.json",
+    "LOG_FILE": "flexiroam.log",
+    "MAX_DAILY_ADDS": 4,
+    "PLAN_THRESHOLD_PERCENT": 30,
+    "PLAN_CHECK_INTERVAL": 120,   # secs
+    "SESSION_REFRESH_INTERVAL": 3600,
+    "MIN_PLAN_DELAY": 6,          # hours
+}
 
-def main():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s.%(msecs)03d [%(levelname)s] [%(filename)s:%(lineno)d] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-    logging.info("正在启动 Flexiroam 自动注册 MasterCard 免费 3G Plan 脚本程序......")
+API = {
+    "LOGIN":       "https://prod-enduserservices.flexiroam.com/api/user/login",
+    "CREDENTIALS": "https://www.flexiroam.com/api/auth/callback/credentials?",
+    "CSRF":        "https://www.flexiroam.com/api/auth/csrf",
+    "SESSION":     "https://www.flexiroam.com/api/auth/session",
+    "PLANS":       "https://www.flexiroam.com/en-us/my-plans",
+    "START_PLAN":  "https://prod-planservices.flexiroam.com/api/plan/start",
+    "ELIG_CHECK":  "https://prod-enduserservices.flexiroam.com/api/user/redemption/check/eligibility",
+    "REDEMPTION":  "https://prod-enduserservices.flexiroam.com/api/user/redemption/confirm",
+}
 
-    session = requests.session()
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def retry_on_failure(total=3, backoff=2):
+    """Decorator to retry transient failures."""
+    def deco(fn):
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            delay = 1
+            for attempt in range(1, total + 1):
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    logging.warning(f"{fn.__name__} attempt {attempt} failed: {e}")
+                    if attempt == total:
+                        raise
+                    time.sleep(delay)
+                    delay *= backoff
+        return wrapped
+    return deco
 
-    logging.info("正在登录获取 token ......")
-    
-    res, resultLogin = login(session, USERNAME, PASSWORD)
-    if not res:
-        logging.error("登录获取 token 失败！ 原因: " + resultLogin)
-        exit(1)
+def load_state(path):
+    if Path(path).exists():
+        return json.loads(Path(path).read_text())
+    return {"day_adds": 0, "last_add": None}
+def save_state(path, state):
+    Path(path).write_text(json.dumps(state, default=str))
 
-    logging.info("正在获取 csrf ......")
-    res, csrf = getCsrf(session)
-    token = resultLogin["token"]
+def setup_logging(log_file, level=logging.INFO):
+    handlers = [
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(log_file)
+    ]
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers
+    )
 
-    if not res:
-        logging.error("获取 csrf 失败！ 原因: " + csrf)
-        exit(1)
+def create_session():
+    s = requests.Session()
+    retries = Retry(total=5, backoff_factor=1, status_forcelist=[502,503,504])
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    return s
 
-    logging.info("正在认证获取 __Secure-authjs.session-token ......")
-
-    # 获取认证 Cookie
-    res, resultCredentials = credentials(session, csrf, token)
-
-    if not res:
-        logging.error("获取 __Secure-authjs.session-token 失败！ 原因: " + resultCredentials)
-        exit(1)
-
-    logging.info("登录成功！正在初始化计划信息，并启用 session 更新......")
-
-    # 启动 session 更新线程
-    threading.Thread(target=updateSessionThread, daemon=True, kwargs={ "session": session }).start()
-
-    # 启动 计划管理线程
-    threading.Thread(target=autoActivePlansThread, daemon=True, kwargs={ "session": session, "token": token }).start()
-
-    # 梗塞进程
-    while True:
-        time.sleep(1000)
-
-# 计划管理线程
-def autoActivePlansThread(session, token):
-    def selectOutPlans(plans):
-        newPlans = []
-
-        for plan in plans["plans"]:
-            percentage = plan["circleChart"]["percentage"]
-
-            if percentage != 0:
-                newPlans.append(plan)
-
-        return newPlans
-    
-    def getActivePercentage(plans):
-        allRate = 0
-        
-        for plan in plans:
-            if plan["status"] == 'Active':
-                allRate += plan["circleChart"]["percentage"]
-        
-        return allRate
-
-    def getInactivePlan(plans):
-        allCount = 0
-        planId = 0
-        allRate = 0
-
-        for plan in plans["plans"]:
-            if plan["status"] == 'In-active':
-                allCount += 1
-                allRate += plan["circleChart"]["percentage"]
-                
-                if planId == 0:
-                    planId = plan["planId"]
-                    continue
-        
-        return allCount, allRate, planId
-    
-    # 默认时间
-    dayGet = 0
-    timeSec = 0
-
-    # 保守起见
-    lastGetPlansTime = datetime.now() - timedelta(hours=7)
-    while True:
-
-        # 默认120秒
-        time.sleep(120)
-
-        # 一天最大获取计划上限重置
-        timeSec += 120
-        if timeSec > 86400:
-            dayGet = 0
-            timeSec = 0
-
-        # 获取当前计划
-        res, resultPlans = getPlans(session)
-
-        if not res and "获取计划失败，没有寻找到计划信息" not in resultPlans:
-            logging.error("获取 Plans 失败！ 原因: " + resultPlans)
-            continue
-        
-        if not res:
-            resultPlans = { "plans": [] }
-
-        activePlans = selectOutPlans(resultPlans)
-        balanceCount, inRate, fristPlanId = getInactivePlan(resultPlans)
-
-        # 获取目前剩余流量
-        rateRoam = getActivePercentage(activePlans)
-
-        logging.info("已经激活流量：「" + str((rateRoam / 100) * 3) + " G」,未激活流量：「" + str((inRate / 100) * 3) + " G」,剩余计划数：「" + str(balanceCount) + "」")
-
-
-        current_time = datetime.now() 
-        # 判断是否流量不够了
-        if rateRoam <= 30 and balanceCount != 0:
-            res, resultStartPlan = startPlans(session, token, fristPlanId)
-            
-            if not res:
-                logging.error("启动新 Plans 失败！ 原因: " + resultStartPlan)
-                continue
-            
-            # 如果启动新计划了，等待一个小时候后再注册新计划
-            if current_time - lastGetPlansTime >= timedelta(hours=6):
-                lastGetPlansTime = datetime.now() - timedelta(hours=5)
-                
-            logging.info("启动新 Plans 成功！ PlanId: " + str(fristPlanId))
-            continue
-
-        # 自动补充计划
-        if balanceCount < 2 and dayGet < 4 and current_time - lastGetPlansTime >= timedelta(hours=6):
-            result = eligibilityAddToAccount(session, token)
-            if result == 1:
-                # 重置时间
-                lastGetPlansTime = datetime.now()
-
-            if result != 0:
-                continue
-        
-            # 获取 +1
-            dayGet += 1
-
-            # 重置时间
-            lastGetPlansTime = datetime.now()
-
-
-
-def eligibilityAddToAccount(session, token):
-    # 生成卡号
-    cardNumber = generate_card_number(CARDBIN)
-
-    # 确认卡号是否符合规则
-    res, resultEligibilityPlan = eligibilityPlan(session, token, cardNumber)
-    
-    if not res:
-        if resultEligibilityPlan == "We are currently processing your previous redemption, kindly retry again later":
-            logging.warning("确认卡号资格失败！ 原因: 正在等待新计划下发，重置等待时间2小时 cardinfo: " + cardNumber)
-            return 1
-        
-        # 直接停止运行
-        if "账号被封" in resultEligibilityPlan or "卡号不符合规则" in resultEligibilityPlan:
-            logging.warning("确认卡号资格失败！ 原因: "+ resultEligibilityPlan + " cardinfo: " + cardNumber)
-            exit(-1)
-        
-        logging.error("确认卡号资格失败！ 原因: " + resultEligibilityPlan + " cardinfo: " + cardNumber)
-        return 2
-    
-    # 确认注册计划
-    res, resultRedemptionConfirm = redemptionConfirm(session, token, resultEligibilityPlan)
-
-    if not res:
-        logging.error("获取新 Plans 失败！ 原因: " + resultRedemptionConfirm + " cardinfo: " + cardNumber)
-        return 2
-
-    logging.info("获取新 Plans 成功！ msg: " + resultRedemptionConfirm + " cardinfo: " + cardNumber)
-    return 0
-
-# 自动更新 Session 线程
-def updateSessionThread(session):
-    while True:
-        res, result = updateSession(session)
-
-        if not res:
-            logging.error("更新 Session 失败！ 原因: " + result)
-            exit(1)
-
-        logging.info("更新 Session 成功！")
-        time.sleep(3600)
-
-# 信用卡计算工具
-############################################
-
-def luhn_checksum(card_number):
-    """计算 Luhn 校验和"""
-    digits = [int(d) for d in card_number]
-    for i in range(len(digits) - 2, -1, -2):  # 从倒数第二位开始，每隔一位翻倍
-        digits[i] *= 2
-        if digits[i] > 9:
-            digits[i] -= 9  # 如果翻倍后大于 9，则减去 9
-    return sum(digits) % 10  # Luhn 校验值
+def luhn_checksum(num: str) -> int:
+    digits = [int(d) for d in num]
+    for i in range(len(digits) - 2, -1, -2):
+        digits[i] = digits[i] * 2 - 9 if digits[i] * 2 > 9 else digits[i] * 2
+    return sum(digits) % 10
 
 def generate_card_number(bin_prefix, length=16):
-    """基于 BIN 生成符合 Luhn 规则的完整卡号"""
     while True:
-        card_number = bin_prefix + ''.join(str(random.randint(0, 9)) for _ in range(length - len(bin_prefix) - 1))
-        check_digit = (10 - luhn_checksum(card_number + "0")) % 10  # 计算 Luhn 校验位
-        full_card_number = card_number + str(check_digit)
-        
-        if luhn_checksum(full_card_number) == 0:  # 确保卡号有效
-            return full_card_number
+        core = bin_prefix + "".join(str(random.randint(0,9)) for _ in range(length - len(bin_prefix) -1))
+        check = (10 - luhn_checksum(core + "0")) % 10
+        full = core + str(check)
+        if luhn_checksum(full) == 0:
+            return full
 
-# API 列表
-############################################
+def notify(subject, message):
+    """Hook to send email/Slack on important events."""
+    logging.info(f"NOTIFY: {subject} – {message}")
+    # e.g. requests.post(slack_webhook, json={...})
 
-def login(session, user, pwd):
-    result = session.post(url="https://prod-enduserservices.flexiroam.com/api/user/login",headers={
-        "authorization": "Bearer " + JWT_Default,
-        "content-type": "application/json",
-        "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
-    },json={
-        "email": user,
-        "password": pwd,
-        "device_udid": "iPhone17,2",
-        "device_model": "iPhone17,2",
-        "device_platform": "ios",
-        "device_version": "18.3.1",
-        "have_esim_supported_device": 1,
-        "notification_token": "undefined"
+# ──────────────────────────────────────────────────────────────────────────────
+# API Client
+# ──────────────────────────────────────────────────────────────────────────────
+class FlexiroamClient:
+    def __init__(self, config, session):
+        self.cfg = config
+        self.s   = session
+        self.token    = None
+        self.csrf     = None
+        self.authcook = None
+
+    @retry_on_failure()
+    def login(self):
+        resp = self.s.post(API["LOGIN"],
+            headers={"Authorization": f"Bearer {self.cfg['JWT_DEFAULT']}", "Content-Type":"application/json"},
+            json={"email": self.cfg["USERNAME"], "password": self.cfg["PASSWORD"], 
+                  "device_udid":"iPhone17,2","device_model":"iPhone17,2",
+                  "device_platform":"ios","device_version":"18.3.1","have_esim_supported_device":1,"notification_token":"undefined"}
+        )
+        data = resp.json()
+        if data.get("message") != "Login Successful":
+            raise RuntimeError(data.get("message"))
+        self.token = data["data"]["token"]
+
+    @retry_on_failure()
+    def fetch_csrf(self):
+        data = self.s.get(API["CSRF"]).json()
+        self.csrf = data["csrfToken"]
+
+    @retry_on_failure()
+    def authenticate(self):
+        resp = self.s.post(API["CREDENTIALS"],
+            headers={"Content-Type":"application/x-www-form-urlencoded"},
+            data={"token":self.token,"redirect":False,"csrfToken":self.csrf,"callbackUrl":"https://www.flexiroam.com/en-us/login"}
+        )
+        if "url" not in resp.json():
+            raise RuntimeError("Credential callback failed")
+
+    @retry_on_failure()
+    def refresh_session(self):
+        data = self.s.get(API["SESSION"]).json()
+        if "expires" not in data:
+            raise RuntimeError("Session refresh failed")
+
+    @retry_on_failure()
+    def get_plans(self):
+        text = self.s.get(API["PLANS"], headers={"rsc":"1"}).text
+        for line in text.splitlines():
+            if line.startswith('{"plans":['):
+                return json.loads(line)
+        return {"plans":[]}
+
+    @retry_on_failure()
+    def start_plan(self, plan_id):
+        resp = self.s.post(API["START_PLAN"],
+            headers={"Authorization":f"Bearer {self.token}", "Content-Type":"application/json"},
+            json={"sim_plan_id": plan_id}
+        )
+        data = resp.json()
+        if "data" not in data:
+            raise RuntimeError(data.get("message"))
+        return True
+
+    @retry_on_failure()
+    def check_eligibility(self, cardnum):
+        resp = self.s.post(API["ELIG_CHECK"],
+            headers={"Authorization":f"Bearer {self.token}", "Content-Type":"application/json"},
+            json={"email":self.cfg["USERNAME"], "lookup_value":cardnum}
+        )
+        msg = resp.json().get("message","")
+        if "eligible" not in msg.lower():
+            raise RuntimeError(msg)
+        return resp.json()["data"]["redemption_id"]
+
+    @retry_on_failure()
+    def confirm_redemption(self, redemption_id):
+        resp = self.s.post(API["REDEMPTION"],
+            headers={"Authorization":f"Bearer {self.token}", "Content-Type":"application/json"},
+            json={"redemption_id": redemption_id}
+        )
+        if resp.json().get("message") != "Redemption confirmed":
+            raise RuntimeError("Redemption confirm failed")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Worker Threads
+# ──────────────────────────────────────────────────────────────────────────────
+def session_refresher(client: FlexiroamClient, stop_evt):
+    while not stop_evt.is_set():
+        try:
+            client.refresh_session()
+            logging.info("Session refreshed")
+        except Exception as e:
+            logging.error(f"Session refresh error: {e}")
+            stop_evt.set()
+        stop_evt.wait(client.cfg["SESSION_REFRESH_INTERVAL"])
+
+def plan_manager(client: FlexiroamClient, stop_evt, state):
+    last_add = datetime.fromisoformat(state.get("last_add")) if state.get("last_add") else datetime.min
+    while not stop_evt.is_set():
+        try:
+            plans = client.get_plans()
+            inactive = [p for p in plans["plans"] if p["status"]=="In-active"]
+            active_pct = sum(p["circleChart"]["percentage"] for p in plans["plans"] if p["status"]=="Active")
+
+            logging.info(f"Active: {active_pct}%  Inactive count: {len(inactive)}")
+            # If active below threshold, activate first inactive
+            if active_pct <= client.cfg["PLAN_THRESHOLD_PERCENT"] and inactive:
+                pid = inactive[0]["planId"]
+                client.start_plan(pid)
+                logging.info(f"Started plan {pid}")
+                notify("Plan Activated", f"Plan ID {pid} activated")
+                last_add = datetime.now()
+                state["last_add"] = last_add.isoformat()
+                save_state(client.cfg["STATE_FILE"], state)
+
+            # If we're below max daily adds and enough time passed, add new
+            now = datetime.now()
+            if (len(inactive) < 2 and 
+                state["day_adds"] < client.cfg["MAX_DAILY_ADDS"] and 
+                (now - last_add) >= timedelta(hours=client.cfg["MIN_PLAN_DELAY"])
+            ):
+                card = generate_card_number(client.cfg["CARDBIN"])
+                rid  = client.check_eligibility(card)
+                client.confirm_redemption(rid)
+                logging.info(f"Redeemed new plan with card {card}")
+                state["day_adds"] += 1
+                last_add = now
+                state["last_add"] = last_add.isoformat()
+                save_state(client.cfg["STATE_FILE"], state)
+        except Exception as e:
+            logging.error(f"Plan manager error: {e}")
+        stop_evt.wait(client.cfg["PLAN_CHECK_INTERVAL"])
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+def main():
+    # parse CLI / env
+    parser = ArgumentParser()
+    parser.add_argument("--username", default=os.getenv("FLEXI_USER"))
+    parser.add_argument("--password", default=os.getenv("FLEXI_PWD"))
+    parser.add_argument("--jwt",      default=os.getenv("FLEXI_JWT"))
+    args = parser.parse_args()
+
+    cfg = DEFAULT_CONFIG.copy()
+    cfg.update({
+        "USERNAME": args.username,
+        "PASSWORD": args.password,
+        "JWT_DEFAULT": args.jwt,
     })
+    setup_logging(cfg["LOG_FILE"])
+    logging.info("Starting Flexiroam auto‑plan script…")
 
-    resultJson = result.json()
-    if resultJson["message"] != "Login Successful":
-        return False, resultJson["message"]
-    
-    return True, resultJson["data"]
+    state = load_state(cfg["STATE_FILE"])
+    session = create_session()
+    client  = FlexiroamClient(cfg, session)
 
-def credentials(session, csrf, token):
-    result = session.post(url="https://www.flexiroam.com/api/auth/callback/credentials?", headers={
-        "content-type": "application/x-www-form-urlencoded",
-        "referer": "https://www.flexiroam.com/en-us/login",
-        "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36",
-        "x-auth-return-redirect": "1"
-    }, data={
-        "token": token,
-        "redirect": False,
-        "csrfToken": csrf,
-        "callbackUrl": "https://www.flexiroam.com/en-us/login"
-    })
+    # initial auth
+    client.login()
+    client.fetch_csrf()
+    client.authenticate()
 
-    resultJson = result.json()
-    if "url" not in resultJson:
-        return False, result.text
-    
-    return True, ""
+    stop_evt = threading.Event()
+    # start threads
+    threading.Thread(target=session_refresher, args=(client,stop_evt), daemon=True).start()
+    threading.Thread(target=plan_manager,    args=(client,stop_evt,state), daemon=True).start()
 
-def updateSession(session):
-    result = session.get(url="https://www.flexiroam.com/api/auth/session", headers={
-        "referer": "https://www.flexiroam.com/en-us/home",
-        "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
-    })
-    
-    resultJson = result.json()
-    if "expires" not in resultJson:
-        return False, result.text
-    
-    return True, ""
-
-def getCsrf(session):
-    result = session.get(url="https://www.flexiroam.com/api/auth/csrf", headers={
-        "referer": "https://www.flexiroam.com/en-us/home",
-        "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
-    })
-    
-    resultJson = result.json()
-    if "csrfToken" not in resultJson:
-        return False, result.text
-    
-    return True, resultJson["csrfToken"]
-
-def getPlans(session):
+    # wait for CTRL+C
     try:
-        result = session.get(url="https://www.flexiroam.com/en-us/my-plans", headers={
-            "referer": "https://www.flexiroam.com/en-us/home",
-            "rsc": "1",
-            "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
-        })
-        
-        # 获取只有计划的那个 Json 数据
-        for line in result.text.splitlines():
-            if '{"plans":[' in line:
-                splits = line.split('{"plans":[')
-                resultRaw = '{"plans":[' + splits[1][:len(splits[1]) - 1]
-                
-                return True, json.loads(resultRaw)
-        
-        return False, "获取计划失败，没有寻找到计划信息，可能是没手动注册第一个，操作后等一会就好。"
-    except:
-        time.sleep(1)
-        return getPlans(session)
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logging.info("Shutting down…")
+        stop_evt.set()
 
-def startPlans(session, token, sim_plan_id):
-    result = session.post(url="https://prod-planservices.flexiroam.com/api/plan/start", headers={
-        "authorization": "Bearer " + token,
-        "content-type": "application/json",
-        "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
-    }, json={
-        "sim_plan_id": sim_plan_id
-    })
-
-    resultJson = result.json()
-    if "data" not in resultJson:
-        return False, resultJson["message"]
-    
-    return True, "激活计划成功！"
-
-def eligibilityPlan(session, token, lookup_value):
-    result = session.post(url="https://prod-enduserservices.flexiroam.com/api/user/redemption/check/eligibility", headers={
-        "authorization": "Bearer " + token,
-        "content-type": "application/json",
-        "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
-    }, json={
-        "email": USERNAME,
-        "lookup_value": lookup_value
-    })
-
-    resultJson = result.json()   
-    if "Authorization Failed" in resultJson["message"]:
-        return False, "账号被封，停止运行。"
-    
-    if "Your Mastercard is not eligible for the offer" in resultJson["message"]:
-        return False, "卡号不符合规则。"
-        
-    if "3GB Global Data Plan" not in resultJson["message"]:
-        return False, resultJson["message"]
-    
-    return True, resultJson["data"]["redemption_id"]
-
-def redemptionConfirm(session, token, redemption_id):
-    result = session.post(url="https://prod-enduserservices.flexiroam.com/api/user/redemption/confirm", headers={
-        "authorization": "Bearer " + token,
-        "content-type": "application/json",
-        "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
-    }, json={
-        "redemption_id": redemption_id
-    })
-
-    resultJson = result.json()
-    if resultJson["message"] != "Redemption confirmed":
-        return False, resultJson["message"]
-    
-    return True, "获取新计划成功！"
-
-main()
+if __name__ == "__main__":
+    main()
